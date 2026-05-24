@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd 定时任务模板（早 8:30 + 16:00 北京时间触发）。
+
+  使用方法：
+    1. 把 {{PROJECT_DIR}} 全部替换为本仓库绝对路径，例如 /Users/yourname/stock-briefing-bot
+    2. 替换 {{USER}} 为你的 macOS 用户名（用于 Label 命名，可选）
+    3. 时区映射（Hour 字段是 macOS 本地时区）：
+         - 美西（PDT/PST）: Hour 17/30  和  Hour 1/0
+         - 中国（CST）   : Hour 8/30   和  Hour 16/0
+         - 其他时区，自行换算"当地几点对应北京 8:30 / 16:00"
+    4. 拷到 ~/Library/LaunchAgents/com.{{USER}}.stock-briefing.plist
+    5. launchctl load ~/Library/LaunchAgents/com.{{USER}}.stock-briefing.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.{{USER}}.stock-briefing</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{PROJECT_DIR}}/scripts/run_brief_cn.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>1</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/logs/launchd_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/logs/launchd_stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin</string>
+        <key>LANG</key>
+        <string>zh_CN.UTF-8</string>
+    </dict>
+</dict>
+</plist>
