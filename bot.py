@@ -113,21 +113,61 @@ HELP_TEXT = """🤖 股民简报机器人，支持命令：
   @股民简报 brief       — 跑完整简报（5-7 分钟）"""
 
 
-def resolve_stock(text: str) -> tuple[str, str, str] | None:
-    """识别用户输入 → (code, name, market)；找不到返回 None"""
+_FILLER_PATTERNS = [
+    r"^分析一下\s*", r"^看一下\s*", r"^看看\s*", r"^分析\s*", r"^查一下\s*",
+    r"\s*怎么样$", r"\s*如何$", r"\s*怎么办$", r"^请\s*",
+]
+
+
+def _strip_fillers(s: str) -> str:
+    for p in _FILLER_PATTERNS:
+        s = re.sub(p, "", s).strip()
+    return s.strip(" ，,。.?？!！")
+
+
+def _find_name_in_text(name: str, text: str) -> str | None:
+    """在 text 里找 name 或其简称，返回实际命中的子串"""
+    if name in text:
+        return name
+    if len(name) >= 3:
+        # 后 2-3 字（"茅台" of "贵州茅台"、"科技" of "蓝思科技"）
+        for n in (name[-3:], name[-2:], name[:3], name[:2]):
+            if n and n in text:
+                return n
+    # text 自身是 name 的子串（用户输入"珂玛"，name 是"珂玛科技"）
+    cleaned = text.strip()
+    if 2 <= len(cleaned) <= len(name) and cleaned in name:
+        return cleaned
+    return None
+
+
+def resolve_stock(text: str) -> tuple[str, str, str, str] | None:
+    """识别用户输入 → (code, name, market, user_context)；找不到 → None
+    user_context = 用户在股票代码/名字外说的其他话（"我有 1000 股 75 入"之类）"""
     text = text.strip()
     wl = _load_watchlist()
-    # 6 位代码
-    if re.fullmatch(r"\d{6}", text):
-        for s in wl:
-            if s["code"] == text:
-                return s["code"], s["name"], s.get("market", "a")
-        # 不在 watchlist 里但代码有效 → 默认按 A 股
-        return text, text, "a"
-    # 名字模糊匹配
+
+    # 1) 嵌入的 6 位代码
+    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    if m:
+        code = m.group(1)
+        s = next((x for x in wl if x["code"] == code), None)
+        name = s["name"] if s else code
+        market = s.get("market", "a") if s else "a"
+        remaining = (text[:m.start()] + text[m.end():]).strip()
+        return code, name, market, _strip_fillers(remaining)
+
+    # 2) 名字模糊匹配（含简称）。选 hit 子串最长的（避免歧义短匹配优先长完整名）
+    matches = []
     for s in wl:
-        if s["name"] == text or text in s["name"] or s["name"] in text:
-            return s["code"], s["name"], s.get("market", "a")
+        hit = _find_name_in_text(s["name"], text)
+        if hit:
+            matches.append((s, hit))
+    if matches:
+        best_s, best_hit = max(matches, key=lambda x: len(x[1]))
+        remaining = text.replace(best_hit, "", 1).strip()
+        return best_s["code"], best_s["name"], best_s.get("market", "a"), _strip_fillers(remaining)
+
     return None
 
 
@@ -166,12 +206,17 @@ def handle_command(text: str, message_id: str, chat_id: str) -> None:
     # 单股
     hit = resolve_stock(text)
     if hit:
-        code, name, market = hit
+        code, name, market, user_context = hit
         if market != "a":
             reply_text(message_id, f"⚠️ 暂只支持 A 股深度分析，{name}({code}) 是 {market.upper()}")
             return
-        reply_text(message_id, f"⏳ 分析 {name}({code}) 中（约 60-90 秒，含 LLM）...")
-        threading.Thread(target=_task_stock_analysis, args=(message_id, code, name), daemon=True).start()
+        hint = f"（含个人 context: 「{user_context}」）" if user_context else ""
+        reply_text(message_id, f"⏳ 分析 {name}({code}){hint} 中（约 60-90 秒，含 LLM）...")
+        threading.Thread(
+            target=_task_stock_analysis,
+            args=(message_id, code, name, user_context),
+            daemon=True,
+        ).start()
         return
 
     # 默认帮助
@@ -229,15 +274,23 @@ def _task_hot_money(message_id: str):
         reply_text(message_id, f"⚠️ 龙虎榜拉取失败: {type(e).__name__}: {e}")
 
 
-def _task_stock_analysis(message_id: str, code: str, name: str):
+def _task_stock_analysis(message_id: str, code: str, name: str, user_context: str = ""):
     try:
+        import akshare as ak
+        import pandas as pd
         from brief import (
-            fetch_market_tables, gather_a, llm_summarize, render_markdown,
+            YESTERDAY, TODAY, gather_a, llm_summarize, safe,
         )
-        # 单股分析需要 Layer 1 公共表（用于 lookup 龙虎榜命中 / 大宗 / 融资融券）
-        market = fetch_market_tables()
+        # 单股只需要 lookup 用的几张表（不拉板块 + 游资聚合，那是 Layer 1 全市场动作）
+        market = {
+            "lhb":         safe("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY), pd.DataFrame()),
+            "dzjy":        safe("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY), pd.DataFrame()),
+            "margin_sse":  safe("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY), pd.DataFrame()),
+            "margin_szse": safe("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY), pd.DataFrame()),
+            "industry_list": pd.DataFrame(),  # 板块同业跳过
+        }
         payload = gather_a(code, market)
-        summary = llm_summarize(name, code, payload)
+        summary = llm_summarize(name, code, payload, user_context=user_context)
         # 包装成 markdown
         k = payload.get("K线技术") or {}
         h = payload.get("北向持股") or {}
@@ -246,6 +299,8 @@ def _task_stock_analysis(message_id: str, code: str, name: str):
             head.append(f"**今日**：¥{k.get('收盘')} ({k.get('当日涨跌幅%')}%) | 5 日 {k.get('5日累计涨跌幅%')}% | MA: {k.get('均线排列')} | MACD: {k.get('MACD金叉死叉')} (柱 {k.get('MACD柱')})\n")
         if h:
             head.append(f"**北向**：占 A 股 {h.get('持股占A股%')}% | 7 日累计 **{h.get('7日累计增持(亿元)')} 亿**\n")
+        if user_context:
+            head.append(f"**🧑 你的 context**：{user_context}\n")
         body = "\n".join(head) + "\n---\n" + summary
         reply_card(message_id, f"📊 {name} 分析 · {datetime.now().strftime('%H:%M')}", body)
     except Exception as e:

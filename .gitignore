@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 .env
 data/*.db
-data/*.json
+data/cache/
+data/probe_*.json
 logs/
 reports/
 .DS_Store
