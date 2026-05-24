@@ -730,11 +730,33 @@ def us_news(code: str) -> list[dict]:
 # ====================================================
 # 飞书推送
 # ====================================================
+_LARK_CLIENT = None
+
+
+def _get_lark_client():
+    """懒加载应用机器人 client；失败返回 None"""
+    global _LARK_CLIENT
+    if _LARK_CLIENT is not None:
+        return _LARK_CLIENT
+    app_id = os.getenv("FEISHU_APP_ID")
+    app_secret = os.getenv("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        return None
+    try:
+        import lark_oapi as lark
+        _LARK_CLIENT = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
+        return _LARK_CLIENT
+    except Exception as e:
+        print(f"⚠️  飞书 client 初始化失败：{type(e).__name__}: {e}")
+        return None
+
+
 def push_feishu(title: str, content_md: str) -> bool:
-    """推送 Markdown 到飞书。每个章节(### 单股 / ## 大区块)一条独立消息，确保完整渲染不被截断。"""
-    webhook = os.getenv("FEISHU_WEBHOOK_URL")
-    if not webhook:
-        print("⚠️  未配置 FEISHU_WEBHOOK_URL，跳过推送")
+    """通过应用机器人发到指定群（FEISHU_CHAT_ID），每段独立消息防截断"""
+    client = _get_lark_client()
+    chat_id = os.getenv("FEISHU_CHAT_ID")
+    if not client or not chat_id:
+        print("⚠️  未配置 FEISHU_APP_ID/SECRET/CHAT_ID，跳过推送")
         return False
 
     sections = _split_markdown(content_md)
@@ -742,40 +764,46 @@ def push_feishu(title: str, content_md: str) -> bool:
     sent = 0
     for i, sec in enumerate(sections, 1):
         sec_title = f"{title} ({i}/{total})"
-        if _post_one_card(webhook, sec_title, sec):
+        if _post_card_via_app(client, chat_id, sec_title, sec):
             sent += 1
-        time.sleep(0.5)  # 防止飞书限频
+        time.sleep(0.5)
 
-    print(f"✅ 飞书推送：{sent}/{total} 段成功")
+    print(f"✅ 飞书推送（应用机器人）：{sent}/{total} 段成功")
     return sent == total
 
 
-def _post_one_card(webhook: str, title: str, body_md: str) -> bool:
-    """单条飞书卡片消息"""
-    # 飞书 markdown element 单个上限 ~5000 字符；超长仍截断
+def _post_card_via_app(client, chat_id: str, title: str, body_md: str) -> bool:
+    """单条飞书 interactive card via 应用机器人 API"""
     if len(body_md) > 4800:
         body_md = body_md[:4800] + "\n\n... (内容截断，完整版见本地 reports/)"
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True, "enable_forward": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue",
-            },
-            "elements": [{"tag": "markdown", "content": body_md}],
+    card = {
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "blue",
         },
+        "elements": [{"tag": "markdown", "content": body_md}],
     }
     try:
-        import requests
-        r = requests.post(webhook, json=payload, timeout=10)
-        result = r.json()
-        if result.get("code") == 0 or result.get("StatusCode") == 0:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest, CreateMessageRequestBody,
+        )
+        req = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(json.dumps(card, ensure_ascii=False))
+                .build()
+            ).build()
+        resp = client.im.v1.message.create(req)
+        if resp.success():
             return True
-        print(f"  ⚠️  飞书推送失败：{result}")
+        print(f"  ⚠️  推送失败：code={resp.code} msg={resp.msg}")
         return False
     except Exception as e:
-        print(f"  ⚠️  飞书推送异常：{type(e).__name__}: {e}")
+        print(f"  ⚠️  推送异常：{type(e).__name__}: {e}")
         return False
 
 
