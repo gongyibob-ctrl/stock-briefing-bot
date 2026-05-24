@@ -177,17 +177,54 @@ def fetch_market_tables() -> dict:
     return tables
 
 
+# 知名游资席位 tag 判断（来自 seats.json hot_money 区）
+_HOT_MONEY_TAGS = {"孙哥", "章盟主", "作手新一", "赵老哥", "涛哥", "小鳄鱼", "炒股养家", "彩田路", "武定路", "中金上海", "银河绍兴"}
+
+
+def _classify_signal_role(tag: str) -> str:
+    """席位 tag → 资金角色（机构 / 知名游资 / 北向 / 散户 / 其他）"""
+    if not tag:
+        return "其他"
+    if "机构" in tag:
+        return "机构"
+    if "北向" in tag:
+        return "北向"
+    if "拉萨" in tag:
+        return "散户"
+    if any(name in tag for name in _HOT_MONEY_TAGS):
+        return "知名游资"
+    return "其他"
+
+
 def layer1_hot_money_summary(lhb_df: pd.DataFrame, date: str, top_n: int = 20) -> dict:
-    """聚合昨日 Top N 上榜股的席位 → 找出最活跃的游资 / 机构 / 北向"""
+    """复用一次席位拉取，同时返回：
+    1. top_seats - 席位聚合（哪个游资/机构今日最活跃）
+    2. lhb_diagnose - 个股诊断（每只上榜股是看好/看空/博弈）
+    3. 待命名席位 - 发现新游资候选
+    """
     if lhb_df is None or lhb_df.empty:
         return {}
-    # 按成交额排前 N，按股票代码去重（一股可能多个指标）
     top = lhb_df.sort_values("成交额", ascending=False).drop_duplicates("股票代码").head(top_n)
-    print(f"  · 拉 Top {len(top)} 龙虎榜股票席位明细（聚合游资动作）...")
+    print(f"  · 拉 Top {len(top)} 龙虎榜股票席位明细（席位聚合 + 个股诊断）...")
 
     seat_aggr: dict = {}
+    per_stock: dict = {}  # 股票代码 → {机构买/机构卖/游资买列表/散户买/北向买/北向卖/触发}
+
     for _, row in top.iterrows():
         code = row["股票代码"]
+        name = row["股票名称"]
+        per_stock[code] = {
+            "代码": code,
+            "名称": name,
+            "收盘": row.get("收盘价"),
+            "对应值": row.get("对应值"),
+            "指标": row.get("指标", ""),
+            "机构买": 0.0, "机构卖": 0.0,
+            "知名游资买": [],  # list of (tag_name, amount_yuan)
+            "知名游资卖": [],
+            "散户买": 0.0, "散户卖": 0.0,
+            "北向买": 0.0, "北向卖": 0.0,
+        }
         for flag in ("买入", "卖出"):
             df = safe(
                 f"席位 {code} {flag}",
@@ -200,33 +237,54 @@ def layer1_hot_money_summary(lhb_df: pd.DataFrame, date: str, top_n: int = 20) -
                 seat = r.get("交易营业部名称") or ""
                 if not seat:
                     continue
+                tag = classify_seat(seat)
+                buy_yuan = _num(r.get("买入金额"))
+                sell_yuan = _num(r.get("卖出金额"))
+
+                # 席位 → 股票聚合（不变）
                 rec = seat_aggr.setdefault(seat, {
-                    "tag": classify_seat(seat),
+                    "tag": tag,
                     "买入": 0.0, "卖出": 0.0, "股票数": 0, "股票": [],
                 })
-                rec["买入"] += _num(r.get("买入金额"))
-                rec["卖出"] += _num(r.get("卖出金额"))
+                rec["买入"] += buy_yuan
+                rec["卖出"] += sell_yuan
                 if code not in rec["股票"]:
                     rec["股票"].append(code)
                     rec["股票数"] += 1
 
+                # 股票 → 角色聚合（新增）
+                role = _classify_signal_role(tag)
+                st = per_stock[code]
+                if role == "机构":
+                    st["机构买"] += buy_yuan
+                    st["机构卖"] += sell_yuan
+                elif role == "北向":
+                    st["北向买"] += buy_yuan
+                    st["北向卖"] += sell_yuan
+                elif role == "散户":
+                    st["散户买"] += buy_yuan
+                    st["散户卖"] += sell_yuan
+                elif role == "知名游资":
+                    if buy_yuan > 1e6:  # 100 万门槛过滤噪音
+                        st["知名游资买"].append((tag, buy_yuan))
+                    if sell_yuan > 1e6:
+                        st["知名游资卖"].append((tag, sell_yuan))
+
+    # === 席位维度聚合（保持原有 top_seats / 待命名） ===
     rows = []
     for seat, rec in seat_aggr.items():
         net = rec["买入"] - rec["卖出"]
         rows.append({
-            "席位": seat,
-            "标签": rec["tag"],
+            "席位": seat, "标签": rec["tag"],
             "买入(万)": round(rec["买入"] / 1e4, 1),
             "卖出(万)": round(rec["卖出"] / 1e4, 1),
             "净额(万)": round(net / 1e4, 1),
             "命中股票数": rec["股票数"],
             "命中股票": rec["股票"][:3],
         })
-    # 只留有名号或命中 ≥ 2 只票的"显著"席位
     significant = [r for r in rows if r["标签"] or r["命中股票数"] >= 2]
     significant.sort(key=lambda x: abs(x["净额(万)"]), reverse=True)
 
-    # V1.5: 待命名席位发现（无 tag + 命中 ≥ 阈值 + 净额绝对值 ≥ 阈值）
     disc_cfg = _load_seats().get("discovery", {})
     min_stocks = disc_cfg.get("min_stocks", 3)
     min_net_wan = disc_cfg.get("min_net_amount_yuan", 100_000_000) / 1e4
@@ -237,10 +295,46 @@ def layer1_hot_money_summary(lhb_df: pd.DataFrame, date: str, top_n: int = 20) -
     ]
     discoveries.sort(key=lambda x: abs(x["净额(万)"]), reverse=True)
 
+    # === 个股诊断（🟢🔴⚪） ===
+    diagnose_threshold_inst = 1e8       # 机构净买/卖 1 亿
+    diagnose_threshold_hot = 5e7        # 知名游资买入 5000 万
+    diagnose_threshold_retail = 5e7     # 拉萨散户买入 5000 万
+    diagnoses = []
+    for code, s in per_stock.items():
+        inst_net = s["机构买"] - s["机构卖"]
+        hot_buy_total = sum(amt for _, amt in s["知名游资买"])
+        hot_sell_total = sum(amt for _, amt in s["知名游资卖"])
+        retail_buy = s["散户买"]
+
+        verdict, reason = "⚪", "博弈不明"
+        if inst_net >= diagnose_threshold_inst:
+            verdict, reason = "🟢", f"机构净买 +{inst_net/1e8:.2f} 亿"
+        elif hot_buy_total >= diagnose_threshold_hot:
+            top_hot = max(s["知名游资买"], key=lambda x: x[1])
+            verdict, reason = "🟢", f"{top_hot[0]} 买入 {top_hot[1]/1e4:.0f} 万"
+        elif inst_net <= -diagnose_threshold_inst:
+            verdict, reason = "🔴", f"机构净卖 -{abs(inst_net)/1e8:.2f} 亿"
+        elif retail_buy >= diagnose_threshold_retail and inst_net < 0:
+            verdict, reason = "🔴", f"散户接盘（拉萨买 {retail_buy/1e4:.0f} 万 + 机构 -{abs(inst_net)/1e4:.0f} 万）"
+        elif hot_sell_total >= diagnose_threshold_hot:
+            top_hot = max(s["知名游资卖"], key=lambda x: x[1])
+            verdict, reason = "🔴", f"{top_hot[0]} 卖出 {top_hot[1]/1e4:.0f} 万"
+
+        diagnoses.append({
+            "代码": s["代码"], "名称": s["名称"],
+            "对应值": s["对应值"], "指标": s["指标"],
+            "判断": verdict, "理由": reason,
+        })
+
+    # 排序：🟢 在前，🔴 中间，⚪ 在后；同 verdict 内按指标排（涨跌 / 换手）
+    order_key = {"🟢": 0, "🔴": 1, "⚪": 2}
+    diagnoses.sort(key=lambda d: (order_key[d["判断"]], d["代码"]))
+
     return {
         "top_seats": significant[:15],
         "总股票数": len(top),
         "待命名席位": discoveries[:max_show],
+        "lhb_diagnose": diagnoses,
     }
 
 
@@ -270,20 +364,50 @@ def a_lhb_seats(code: str, date: str) -> dict:
 
 
 def _hsgt_summary() -> dict:
-    def _fetch():
+    """北向资金当日实时（fund_flow_summary）+ 历史累计（hist_em）双源。"""
+    # 主：当日实时（fund_flow_summary）
+    def _from_summary():
+        df = ak.stock_hsgt_fund_flow_summary_em()
+        if df is None or df.empty:
+            return {}
+        north = df[df.get("资金方向", pd.Series([], dtype=str)) == "北向"]
+        if north.empty:
+            return {}
+        sh = north[north["板块"].str.contains("沪股通", na=False)]
+        sz = north[north["板块"].str.contains("深股通", na=False)]
+        sh_net = float(sh["成交净买额"].iloc[0]) if not sh.empty else 0.0
+        sz_net = float(sz["成交净买额"].iloc[0]) if not sz.empty else 0.0
+        sh_idx = float(sh["指数涨跌幅"].iloc[0]) if not sh.empty else None
+        sz_idx = float(sz["指数涨跌幅"].iloc[0]) if not sz.empty else None
+        date = str(north.iloc[0]["交易日"])
+        return {
+            "最近交易日": date,
+            "当日净买额(亿)": round(sh_net + sz_net, 2),
+            "沪股通净买(亿)": round(sh_net, 2),
+            "深股通净买(亿)": round(sz_net, 2),
+            "上证涨幅%": sh_idx,
+            "深证涨幅%": sz_idx,
+        }
+
+    # 备：历史累计（hist_em，近 N 日有效数据）
+    def _from_hist():
         df = ak.stock_hsgt_hist_em(symbol="北向资金")
         if df is None or df.empty:
             return {}
-        recent = df.tail(5)
+        recent = df.tail(10)  # 拉宽窗口提高拿到有效数据的概率
         valid = recent.dropna(subset=["当日成交净买额"])
         if valid.empty:
-            return {"最近交易日": str(recent.iloc[-1]["日期"]), "数据状态": "近 5 日净买额数据未发布"}
+            return {}
         return {
-            "最近交易日": str(valid.iloc[-1]["日期"]),
-            "当日净买额(亿)": round(float(valid.iloc[-1]["当日成交净买额"]) / 100, 2),
-            "5日累计净买(亿)": round(float(valid["当日成交净买额"].sum()) / 100, 2),
+            "5日累计净买(亿)": round(float(valid.tail(5)["当日成交净买额"].sum()) / 100, 2),
+            "10日累计净买(亿)": round(float(valid["当日成交净买额"].sum()) / 100, 2),
         }
-    return safe("北向总览", _fetch, {})
+
+    out = safe("北向当日", _from_summary, {}, retries=2, backoff=1.5)
+    hist = safe("北向累计", _from_hist, {}, retries=2, backoff=1.5)
+    if hist:
+        out.update(hist)
+    return out
 
 
 # ====================================================
@@ -807,16 +931,29 @@ def _post_card_via_app(client, chat_id: str, title: str, body_md: str) -> bool:
         return False
 
 
+def _is_only_header(s: str) -> bool:
+    """段内只剩 H1/H2 标题和空行 → True（这种段不该独立成卡）"""
+    for line in s.split("\n"):
+        l = line.strip()
+        if not l:
+            continue
+        if l.startswith("# ") or l.startswith("## "):
+            continue
+        return False
+    return True
+
+
 def _split_markdown(md: str, layer1_max: int = 4500) -> list[str]:
     """切段：
-    - Layer 1（全市场态势）默认 1 段；超过 layer1_max 字符则按 ### 切
+    - Layer 1 默认 1 段；超过 layer1_max 按 ### 切
     - 自选股深度里每个 ### 永远 = 1 段
+    - 纯标题段（无具体内容）自动 merge 到下一段，不独立成卡
     """
     lines = md.split("\n")
-    layer1_lines = []
-    layer2_chunks = []  # 每只股一段
+    layer1_lines: list[str] = []
+    layer2_chunks: list[str] = []
     in_individual = False
-    cur = []
+    cur: list[str] = []
 
     def push_cur():
         if cur:
@@ -837,26 +974,42 @@ def _split_markdown(md: str, layer1_max: int = 4500) -> list[str]:
             cur.append(line)
     push_cur()
 
-    sections = []
+    # Layer 1 切段
+    layer1_chunks: list[str] = []
     layer1_md = "\n".join(layer1_lines).strip()
     if layer1_md:
         if len(layer1_md) <= layer1_max:
-            sections.append(layer1_md)
+            layer1_chunks.append(layer1_md)
         else:
-            # Layer 1 超长，按 ### 切
-            sub = []
+            sub: list[str] = []
             for l in layer1_lines:
                 if l.startswith("### ") and sub and any(x.strip() for x in sub):
                     s = "\n".join(sub).strip()
                     if s and len(s) > 30:
-                        sections.append(s)
+                        layer1_chunks.append(s)
                     sub = []
                 sub.append(l)
             if sub:
                 s = "\n".join(sub).strip()
                 if s and len(s) > 30:
-                    sections.append(s)
-    sections.extend(layer2_chunks)
+                    layer1_chunks.append(s)
+
+    # 关键修复：纯标题段（H1/H2 only）merge 到下一段头部，不独立成卡
+    merged_layer1: list[str] = []
+    pending_header = ""
+    for chunk in layer1_chunks:
+        if _is_only_header(chunk):
+            pending_header = (pending_header + "\n\n" + chunk).strip() if pending_header else chunk
+        else:
+            if pending_header:
+                merged_layer1.append(pending_header + "\n\n" + chunk)
+                pending_header = ""
+            else:
+                merged_layer1.append(chunk)
+    if pending_header:
+        merged_layer1.append(pending_header)
+
+    sections = merged_layer1 + layer2_chunks
     return sections
 
 
@@ -1186,22 +1339,57 @@ def render_markdown(market, deep) -> str:
     if market:
         out.append("## 🌐 全市场态势\n")
         hs = market.get("hsgt_summary") or {}
-        out.append("### 北向资金")
         if hs:
-            if "数据状态" in hs:
-                out.append(f"- 最近交易日 {hs['最近交易日']}（{hs['数据状态']}）\n")
+            out.append(f"### 北向资金（{hs.get('最近交易日', '近期')}）")
+            day_net = hs.get("当日净买额(亿)")
+            sh = hs.get("沪股通净买(亿)")
+            sz = hs.get("深股通净买(亿)")
+            # 当日净买非零 → 显示完整明细
+            if day_net is not None and abs(day_net) > 0.01:
+                parts = [f"当日净买 **{day_net:+.2f} 亿**"]
+                if sh is not None and sz is not None:
+                    parts.append(f"沪 {sh:+.2f} / 深 {sz:+.2f}")
+                if hs.get("上证涨幅%") is not None:
+                    parts.append(f"上证 {hs['上证涨幅%']:+.2f}% / 深证 {hs.get('深证涨幅%', 0):+.2f}%")
+                out.append("- " + " ｜ ".join(parts))
             else:
-                out.append(f"- {hs['最近交易日']} 当日净买 **{hs['当日净买额(亿)']} 亿** | 5 日累计 **{hs['5日累计净买(亿)']} 亿**\n")
-        else:
-            out.append("（无数据）\n")
+                # 当日为 0 → 数据未发布（周末 / 盘前 / 当日数据未结算）
+                out.append("- _当日数据未发布（非交易日或盘前），累计数据见下_")
+            if hs.get("5日累计净买(亿)") is not None:
+                out.append(f"- 5 日累计：**{hs['5日累计净买(亿)']:+.2f} 亿** ｜ 10 日累计：**{hs.get('10日累计净买(亿)', 0):+.2f} 亿**")
+            out.append("")
 
         lhb = market.get("lhb")
         if lhb is not None and not lhb.empty:
-            # 市场温度：统计触发条件
             indicators = lhb["指标"].value_counts().head(5).to_dict()
             ind_brief = "; ".join(f"{k} **{v}** 只" for k, v in indicators.items())
             out.append(f"### 龙虎榜温度（{YESTERDAY}）")
             out.append(f"- 共 **{len(lhb)}** 只上榜：{ind_brief}\n")
+
+            # 个股诊断：分类成 🟢/🔴/⚪
+            diagnoses = (market.get("hot_money") or {}).get("lhb_diagnose") or []
+            if diagnoses:
+                good = [d for d in diagnoses if d["判断"] == "🟢"]
+                bad = [d for d in diagnoses if d["判断"] == "🔴"]
+                neutral = [d for d in diagnoses if d["判断"] == "⚪"]
+                out.append(f"### 龙虎榜诊断（Top {len(diagnoses)} 上榜股）\n")
+                out.append("**判断标准**：🟢 机构净买 > 1 亿 或 知名游资买 > 5000 万 ｜ 🔴 机构净卖 > 1 亿 或 散户接盘 ｜ ⚪ 博弈不明\n")
+                if good:
+                    out.append(f"**🟢 看好（{len(good)} 只）**")
+                    for d in good[:10]:
+                        change = f" {float(d['对应值']):+.1f}%" if d.get("对应值") not in (None, "") else ""
+                        out.append(f"- {d['名称']} ({d['代码']}){change} · **{d['理由']}**")
+                    out.append("")
+                if bad:
+                    out.append(f"**🔴 看空（{len(bad)} 只）**")
+                    for d in bad[:10]:
+                        change = f" {float(d['对应值']):+.1f}%" if d.get("对应值") not in (None, "") else ""
+                        out.append(f"- {d['名称']} ({d['代码']}){change} · **{d['理由']}**")
+                    out.append("")
+                if neutral:
+                    sample = ", ".join(f"{d['名称']}({d['代码']})" for d in neutral[:5])
+                    more = "…" if len(neutral) > 5 else ""
+                    out.append(f"**⚪ 博弈不明（{len(neutral)} 只）**：{sample}{more}\n")
 
         # 今日全市场游资动作（Option A 聚合）—— 用 list 格式不用表格
         hm = market.get("hot_money") or {}
