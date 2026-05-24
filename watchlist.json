@@ -1,0 +1,11 @@
+{
+  "watchlist": [
+    {"code": "600519", "name": "贵州茅台",   "market": "a"},
+    {"code": "300750", "name": "宁德时代",   "market": "a"},
+    {"code": "002594", "name": "比亚迪",     "market": "a"},
+    {"code": "603687", "name": "大胜达",     "market": "a"},
+    {"code": "300433", "name": "蓝思科技",   "market": "a"},
+    {"code": "301611", "name": "珂玛科技",   "market": "a"},
+    {"code": "688122", "name": "西部超导",   "market": "a"}
+  ]
+}

@@ -1,0 +1,9 @@
+akshare>=1.18
+litellm>=1.80
+python-dotenv>=1.0
+pandas>=2.0
+requests>=2.31
+yfinance>=0.2  # 美股数据源
+baostock>=0.8  # A 股行情主源
+curl_cffi>=0.5  # 同花顺板块需要浏览器 TLS 指纹
+lark-oapi>=1.6  # 飞书应用机器人长连接
