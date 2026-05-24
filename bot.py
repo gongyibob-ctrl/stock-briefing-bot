@@ -54,6 +54,19 @@ def _load_watchlist():
     return json.loads((ROOT / "watchlist.json").read_text())["watchlist"]
 
 
+@functools.lru_cache(maxsize=1)
+def _all_a_stocks() -> list[dict]:
+    """全 A 股 code/name 列表（首次调用拉一次，进程内缓存）。
+    用于非自选股按名字 @ 时的 fallback 查询。"""
+    try:
+        import akshare as ak
+        df = ak.stock_info_a_code_name()  # cols: code, name
+        return [{"code": str(r["code"]), "name": str(r["name"])} for _, r in df.iterrows()]
+    except Exception as e:
+        print(f"⚠️  全 A 股列表拉取失败: {type(e).__name__}: {e}")
+        return []
+
+
 # =================================================
 # 推送辅助
 # =================================================
@@ -102,12 +115,13 @@ def reply_card(message_id: str, title: str, markdown_body: str) -> None:
 # =================================================
 HELP_TEXT = """🤖 股民简报机器人，支持命令：
 
-📋 自选股
-  @股民简报 watchlist   — 列当前自选股
-  @股民简报 茅台        — 单股分析（也可用代码）
-  @股民简报 600519      — 同上
+📊 单股分析（盘中拿实时价 + 主力净流入）
+  @股民简报 600519      — 任意 6 位 A 股代码（不必在自选股）
+  @股民简报 万华化学    — 完整公司名（非自选股需写全名避免歧义）
+  @股民简报 茅台        — 自选股可用简称
 
 🌐 全市场
+  @股民简报 watchlist   — 列当前自选股
   @股民简报 板块        — 今日强势板块 + Top 3
   @股民简报 龙虎榜      — 昨日游资动作
   @股民简报 brief       — 跑完整简报（5-7 分钟）"""
@@ -167,6 +181,15 @@ def resolve_stock(text: str) -> tuple[str, str, str, str] | None:
         best_s, best_hit = max(matches, key=lambda x: len(x[1]))
         remaining = text.replace(best_hit, "", 1).strip()
         return best_s["code"], best_s["name"], best_s.get("market", "a"), _strip_fillers(remaining)
+
+    # 3) Fallback: 全 A 股完整名字匹配（要求 stock.name 完整出现在 text 中，避免歧义）
+    all_a = _all_a_stocks()
+    full_hits = [s for s in all_a if s["name"] and s["name"] in text]
+    if full_hits:
+        # 多个匹配选名字最长的（更具体），单个就直接用
+        best = max(full_hits, key=lambda s: len(s["name"]))
+        remaining = text.replace(best["name"], "", 1).strip()
+        return best["code"], best["name"], "a", _strip_fillers(remaining)
 
     return None
 
@@ -289,7 +312,8 @@ def _task_stock_analysis(message_id: str, code: str, name: str, user_context: st
             "margin_szse": safe("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY), pd.DataFrame()),
             "industry_list": pd.DataFrame(),  # 板块同业跳过
         }
-        payload = gather_a(code, market)
+        # 盘中场景：腾讯 qt 实时优先，baostock 兜底（baostock 只给日 K 收盘价）
+        payload = gather_a(code, market, prefer_realtime=True)
         summary = llm_summarize(name, code, payload, user_context=user_context)
         # 包装成 markdown
         k = payload.get("K线技术") or {}

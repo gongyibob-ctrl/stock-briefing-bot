@@ -473,8 +473,9 @@ def _a_quote_sina(code: str) -> dict:
         return {}
 
 
-def a_quote(code: str) -> dict:
-    """baostock 主源 → 腾讯 qt 兜底；基本面从 stock_meta.json 取"""
+def a_quote(code: str, prefer_realtime: bool = False) -> dict:
+    """baostock 主源 → 腾讯 qt 兜底；基本面从 stock_meta.json 取
+    prefer_realtime=True 时腾讯实时优先（盘中拿当前价 + 委比 + 主力净流入）"""
     def _via_baostock():
         _bs_login()
         end = datetime.now().strftime("%Y-%m-%d")
@@ -498,14 +499,20 @@ def a_quote(code: str) -> dict:
             "行业": meta.get("行业"),
         }
 
-    # 三层 fallback：baostock → 腾讯 → 新浪
-    out = safe(f"行情快照 {code}[baostock]", _via_baostock, {}, retries=1, backoff=1.0)
-    if out.get("最新价") is not None:
-        return out
-    out = safe(f"行情快照 {code}[腾讯]", lambda: _a_quote_tencent(code), {}, retries=3, backoff=2.0)
-    if out.get("最新价") is not None:
-        return out
-    return safe(f"行情快照 {code}[新浪]", lambda: _a_quote_sina(code), {}, retries=3, backoff=2.0)
+    sources = [
+        ("baostock", _via_baostock, 1, 1.0),
+        ("腾讯",     lambda: _a_quote_tencent(code), 3, 2.0),
+        ("新浪",     lambda: _a_quote_sina(code), 3, 2.0),
+    ]
+    if prefer_realtime:
+        # 盘中：腾讯/新浪 实时优先，baostock 兜底（baostock 只给日 K 收盘价）
+        sources = [sources[1], sources[2], sources[0]]
+
+    for label, fn, retries, backoff in sources:
+        out = safe(f"行情快照 {code}[{label}]", fn, {}, retries=retries, backoff=backoff)
+        if out.get("最新价") is not None:
+            return out
+    return {}
 
 
 def _a_kline_tencent(code: str) -> dict:
@@ -558,8 +565,9 @@ def _a_kline_sina(code: str) -> dict:
     return out
 
 
-def a_kline(code: str) -> dict:
-    """baostock K 线 → 腾讯 ifzq 兜底；返回 MA + MACD + 涨跌幅"""
+def a_kline(code: str, prefer_realtime: bool = False) -> dict:
+    """baostock K 线 → 腾讯 ifzq 兜底；返回 MA + MACD + 涨跌幅
+    prefer_realtime=True 时腾讯优先（盘中最后一根日 K 是今日实时不完整 bar）"""
     def _via_baostock():
         _bs_login()
         end = datetime.now().strftime("%Y-%m-%d")
@@ -583,14 +591,19 @@ def a_kline(code: str) -> dict:
         })
         return _enrich_kline(df)
 
-    # 三层 fallback：baostock → 腾讯 ifzq → 新浪
-    out = safe(f"K线 {code}[baostock]", _via_baostock, {}, retries=1, backoff=1.0)
-    if out and out.get("收盘") is not None:
-        return out
-    out = safe(f"K线 {code}[腾讯]", lambda: _a_kline_tencent(code), {}, retries=3, backoff=2.0)
-    if out and out.get("收盘") is not None:
-        return out
-    return safe(f"K线 {code}[新浪]", lambda: _a_kline_sina(code), {}, retries=3, backoff=2.0)
+    sources = [
+        ("baostock", _via_baostock, 1, 1.0),
+        ("腾讯",     lambda: _a_kline_tencent(code), 3, 2.0),
+        ("新浪",     lambda: _a_kline_sina(code), 3, 2.0),
+    ]
+    if prefer_realtime:
+        sources = [sources[1], sources[2], sources[0]]
+
+    for label, fn, retries, backoff in sources:
+        out = safe(f"K线 {code}[{label}]", fn, {}, retries=retries, backoff=backoff)
+        if out and out.get("收盘") is not None:
+            return out
+    return {}
 
 
 def _enrich_kline(df: pd.DataFrame) -> dict:
@@ -1093,12 +1106,12 @@ def llm_summarize(stock_name: str, code: str, payload: dict, user_context: str =
 # ====================================================
 # 主流程
 # ====================================================
-def gather_a(code: str, market: dict) -> dict:
-    quote = a_quote(code)
+def gather_a(code: str, market: dict, prefer_realtime: bool = False) -> dict:
+    quote = a_quote(code, prefer_realtime=prefer_realtime)
     lhb_hit = a_lhb_hit(code, market["lhb"])
     raw = {
         "行情快照": quote,
-        "K线技术": a_kline(code),
+        "K线技术": a_kline(code, prefer_realtime=prefer_realtime),
         "北向持股": a_hsgt(code),
         "龙虎榜命中": lhb_hit,
         "大宗交易": a_dzjy_hit(code, market["dzjy"]),
@@ -1318,8 +1331,14 @@ def main():
     if args.no_notify or args.dry_run:
         print("⏭ 跳过飞书推送")
     else:
+        if args.market_only:
+            mode_label = "🌅 早盘"
+        elif args.stocks:
+            mode_label = "🎯 自选股"
+        else:
+            mode_label = "🌆 收盘"
         push_feishu(
-            title=f"股民简报 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            title=f"{mode_label}简报 · {datetime.now().strftime('%m-%d %H:%M')}",
             content_md=md,
         )
 
@@ -1333,7 +1352,13 @@ def render_brief(market=None, deep=None) -> str:
 
 
 def render_markdown(market, deep) -> str:
-    out = [f"# 股民简报 · {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
+    if market and deep:
+        mode_label = "🌆 收盘简报"
+    elif deep:
+        mode_label = "🎯 自选股简报"
+    else:
+        mode_label = "🌅 早盘简报"
+    out = [f"# {mode_label} · {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
 
     # ===== Layer 1（只在 A 股有 watchlist 时显示）=====
     if market:
