@@ -10,9 +10,14 @@
 set -u
 cd "$(dirname "$0")/.."
 
-HOUR_CN=$(TZ=Asia/Shanghai date "+%H")
-NOW_CN=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M:%S %Z")
-echo "[$(date '+%F %T %Z')] 北京时间 $NOW_CN"
+# 整个 brief.py 在北京时区跑，避免 PDT 的"今天"和北京"今天"错位
+# （否则 PDT Sun 17:30 = 北京 Mon 08:30 时，is_trading_day_today() 会把 Sunday
+# 判成非交易日跳过）
+export TZ=Asia/Shanghai
+
+HOUR_CN=$(date "+%H")
+NOW_CN=$(date "+%Y-%m-%d %H:%M:%S %Z")
+echo "[$(TZ=America/Los_Angeles date '+%F %T %Z')] 北京时间 $NOW_CN"
 
 # strip leading zero (08 -> 8) for shell numeric compare
 HOUR_CN=$((10#$HOUR_CN))

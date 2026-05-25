@@ -54,17 +54,41 @@ def _load_watchlist():
     return json.loads((ROOT / "watchlist.json").read_text())["watchlist"]
 
 
+_A_SHARE_CACHE = ROOT / "data" / "cache" / "a_share_universe.json"
+
+
 @functools.lru_cache(maxsize=1)
 def _all_a_stocks() -> list[dict]:
-    """全 A 股 code/name 列表（首次调用拉一次，进程内缓存）。
+    """全 A 股 code/name 列表（磁盘缓存 + 多源 fallback）。
     用于非自选股按名字 @ 时的 fallback 查询。"""
-    try:
-        import akshare as ak
-        df = ak.stock_info_a_code_name()  # cols: code, name
-        return [{"code": str(r["code"]), "name": str(r["name"])} for _, r in df.iterrows()]
-    except Exception as e:
-        print(f"⚠️  全 A 股列表拉取失败: {type(e).__name__}: {e}")
-        return []
+    # 1) 磁盘缓存（bot 重启秒读）
+    if _A_SHARE_CACHE.exists():
+        try:
+            cached = json.loads(_A_SHARE_CACHE.read_text())
+            if isinstance(cached, list) and cached:
+                return cached
+        except Exception:
+            pass
+    # 2) 在线拉：EM 主源（快 ~2-3s）→ 新浪 spot 备源（~30s 但更稳）
+    import akshare as ak
+    for label, fn in [
+        ("EM code_name", lambda: ak.stock_info_a_code_name()),
+        ("Sina spot",    lambda: ak.stock_zh_a_spot()),
+    ]:
+        try:
+            df = fn()
+            # 规范化：EM 给 code/name；新浪 spot 给 代码(sz002480)/名称
+            if "code" in df.columns:
+                rows = [{"code": str(r["code"]), "name": str(r["name"])} for _, r in df.iterrows()]
+            else:
+                rows = [{"code": str(r["代码"])[-6:], "name": str(r["名称"])} for _, r in df.iterrows()]
+            print(f"✅ 全 A 股拉取成功 ({label}): {len(rows)} 只")
+            _A_SHARE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            _A_SHARE_CACHE.write_text(json.dumps(rows, ensure_ascii=False))
+            return rows
+        except Exception as e:
+            print(f"⚠️  全 A 股 {label} 拉取失败: {type(e).__name__}: {e}")
+    return []
 
 
 # =================================================
@@ -381,6 +405,9 @@ def on_message_receive(data: P2ImMessageReceiveV1) -> None:
 def main():
     print(f"🤖 股民简报机器人启动 (app_id={APP_ID[:12]}...)")
     print("   监听 @ 消息中... Ctrl+C 退出")
+
+    # 后台预热全 A 股列表（首次 @ 非自选股名字时不会卡 30 秒）
+    threading.Thread(target=_all_a_stocks, daemon=True).start()
 
     event_handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message_receive) \
