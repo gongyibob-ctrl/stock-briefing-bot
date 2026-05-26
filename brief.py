@@ -1195,7 +1195,7 @@ def is_trading_day_today() -> bool:
         return True
 
 
-def _build_frontmatter(brief_type: str, market: dict | None, deep: list | None) -> dict:
+def _build_frontmatter(brief_type: str, market: dict | None, deep: list | None, screening: dict | None = None) -> dict:
     """报告文件头的 YAML 元数据；未来批量查询历史用 yaml.safe_load 就能读"""
     import re as _re
     now = datetime.now()
@@ -1232,6 +1232,15 @@ def _build_frontmatter(brief_type: str, market: dict | None, deep: list | None) 
                 "advice": adv_m.group(1) if adv_m else "unknown",
             })
         fm["watchlist_advice"] = wl_advice
+    # Layer 3 信号（自定义筛选）
+    if screening:
+        hits = screening.get("hits") or []
+        fm["screening_candidates"] = screening.get("candidates", 0)
+        fm["screening_hits_count"] = len(hits)
+        fm["screening_hits"] = [
+            {"code": h["code"], "name": h["name"], "涨幅%": h["涨幅%"], "量比": h["量比"]}
+            for h in hits[:20]
+        ]
     return fm
 
 
@@ -1291,6 +1300,86 @@ def _process_stocks(market: dict, stocks_filter: list | None = None, dry_run: bo
     return deep
 
 
+def run_custom_screening() -> dict:
+    """收盘后自定义筛选 — 4 条件同时满足才入选：
+    1. 涨幅 ∈ [3%, 5%]
+    2. 收盘 > MA5 且 > MA10
+    3. 量比 > 2（今日成交量 / 过去 5 个交易日均量）
+    4. 今日成交量 > 前一日
+
+    返回 {"hits": [...], "candidates": N}
+    """
+    print("  · 自定义筛选（涨幅[3,5]% + 站稳MA5/10 + 量比>2 + 放量）...")
+    # 主源 EM（快 ~2s）→ 备源 新浪 spot（慢 ~30s 但更稳）
+    # 退到美西访问中国财经接口偶发挂，加大 retry：EM 5 次 / Sina 3 次
+    spot = safe_df("全市场快照(EM)", lambda: ak.stock_zh_a_spot_em(), retries=5, backoff=5.0)
+    if spot.empty:
+        print("    EM 挂，fallback 新浪 spot...")
+        spot = safe_df("全市场快照(Sina)", lambda: ak.stock_zh_a_spot(), retries=3, backoff=10.0)
+        if not spot.empty:
+            # Sina 代码带 sz/sh 前缀，剥掉
+            spot["代码"] = spot["代码"].astype(str).str[-6:]
+    if spot.empty:
+        print("    ⚠️ 全市场快照多源都失败，跳过筛选")
+        return {"hits": [], "candidates": 0, "error": "全市场快照多源都失败（EM + Sina）"}
+    print(f"    全市场快照拿到（{len(spot)} 只）")
+
+    # Step 1: 涨幅过滤
+    spot = spot.dropna(subset=["涨跌幅"]).copy()
+    candidates = spot[(spot["涨跌幅"] >= 3.0) & (spot["涨跌幅"] <= 5.0)].copy()
+    n_cand = len(candidates)
+    print(f"    涨幅 [3%, 5%] 候选 {n_cand} 只 → 逐个拉 K 线验证 MA / 量比 / 前日量")
+    if n_cand == 0:
+        return {"hits": [], "candidates": 0}
+
+    # Step 2: 对每个候选拉 K 线验证剩余 3 条件
+    hits = []
+    for i, (_, row) in enumerate(candidates.iterrows(), 1):
+        code = str(row["代码"]).strip()
+        name = str(row["名称"]).strip()
+        if i % 50 == 0:
+            print(f"    进度 {i}/{n_cand}，已命中 {len(hits)}")
+        kline = safe_df(
+            f"K线 {code}",
+            lambda c=code: ak.stock_zh_a_hist(symbol=c, period="daily", adjust="qfq", end_date=TODAY),
+            retries=1, backoff=0.5,
+        )
+        if kline.empty or len(kline) < 11:
+            continue
+        try:
+            recent = kline.tail(11).reset_index(drop=True)
+            close_s = recent["收盘"].astype(float)
+            today_close = float(close_s.iloc[-1])
+            ma5 = float(close_s.tail(5).mean())
+            ma10 = float(close_s.tail(10).mean())
+            today_vol = float(recent["成交量"].iloc[-1])
+            prev_vol = float(recent["成交量"].iloc[-2])
+            vol_5_avg = float(recent["成交量"].iloc[-6:-1].mean())  # 不含今日的过去 5 日均量
+            liang_bi = today_vol / vol_5_avg if vol_5_avg > 0 else 0.0
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        if (
+            today_close > ma5
+            and today_close > ma10
+            and liang_bi > 2.0
+            and today_vol > prev_vol
+        ):
+            hits.append({
+                "code": code,
+                "name": name,
+                "涨幅%": round(float(row["涨跌幅"]), 2),
+                "收盘": round(today_close, 2),
+                "MA5": round(ma5, 2),
+                "MA10": round(ma10, 2),
+                "量比": round(liang_bi, 2),
+                "今日量(万手)": round(today_vol / 100, 0),
+                "昨日量(万手)": round(prev_vol / 100, 0),
+            })
+    print(f"    ✅ 命中 {len(hits)} 只 / 候选 {n_cand} 只")
+    hits.sort(key=lambda x: -x["量比"])  # 量比降序：放量最猛的最前
+    return {"hits": hits, "candidates": n_cand}
+
+
 def run_market_review() -> tuple[str, dict]:
     """只跑 Layer 1 全市场态势（约 1-2 分钟）。返回 (md, frontmatter_dict)。"""
     market = fetch_market_tables()
@@ -1309,11 +1398,12 @@ def run_watchlist_brief(stocks_filter: list | None = None, dry_run: bool = False
 
 
 def run_full_brief(stocks_filter: list | None = None, dry_run: bool = False) -> tuple[str, dict]:
-    """Layer 1 + Layer 2 完整简报（约 5-7 分钟）。返回 (md, frontmatter_dict)。"""
+    """收盘后 brief：Layer 1 全市场态势 + Layer 3 自定义筛选（约 3-5 分钟）。
+    不再做 Layer 2 自选股逐只深度分析（改为用户手动 @ bot 查询）。"""
     market = fetch_market_tables()
-    deep = _process_stocks(market, stocks_filter=stocks_filter, dry_run=dry_run)
-    md = render_brief(market=market, deep=deep)
-    fm = _build_frontmatter("full", market, deep)
+    screening = run_custom_screening()
+    md = render_brief(market=market, deep=None, screening=screening)
+    fm = _build_frontmatter("full", market, None, screening=screening)
     return md, fm
 
 
@@ -1335,7 +1425,7 @@ def main():
     elif args.stocks:
         print(f"模式：单股深度 ({args.stocks})")
     else:
-        print("模式：完整简报（Layer 1 + Layer 2）")
+        print("模式：完整简报（Layer 1 全市场 + Layer 3 自定义筛选）")
     if args.dry_run:
         print("⚠️ DRY-RUN: 不调 LLM 不推送")
     elif args.no_notify:
@@ -1381,18 +1471,18 @@ def main():
         print("\n" + "=" * 60 + "\n" + md)
 
 
-def render_brief(market=None, deep=None) -> str:
-    """run_* 入口的统一渲染包装：market/deep 任一可以为 None。"""
-    return render_markdown(market or {}, deep or [])
+def render_brief(market=None, deep=None, screening=None) -> str:
+    """run_* 入口的统一渲染包装：market/deep/screening 任一可以为 None。"""
+    return render_markdown(market or {}, deep or [], screening or {})
 
 
-def render_markdown(market, deep) -> str:
-    if market and deep:
-        mode_label = "🌆 收盘简报"
+def render_markdown(market, deep, screening) -> str:
+    if market and screening:
+        mode_label = "🌆 收盘简报"  # full brief (Layer 1 + Layer 3)
     elif deep:
-        mode_label = "🎯 自选股简报"
+        mode_label = "🎯 自选股简报"  # bot @ 或 --stocks
     else:
-        mode_label = "🌅 早盘简报"
+        mode_label = "🌅 早盘简报"  # market-only (Layer 1)
     out = [f"# {mode_label} · {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"]
 
     # ===== Layer 1（只在 A 股有 watchlist 时显示）=====
@@ -1511,11 +1601,10 @@ def render_markdown(market, deep) -> str:
             out.append(sector_md)
             out.append("")
 
-    # ===== Layer 2 =====
-    if not deep:
-        return "\n".join(out)
-    out.append("\n## 📊 自选股深度\n")
-    for d in deep:
+    # ===== Layer 2（自选股深度 — 仅 deep 非空时，从 --stocks 或 bot 触发）=====
+    if deep:
+      out.append("\n## 📊 自选股深度\n")
+      for d in deep:
         p = d["payload"]
         market_badge = {"a": "🇨🇳", "hk": "🇭🇰", "us": "🇺🇸"}.get(d["market"], "")
         out.append(f"### {market_badge} {d['name']}（{d['code']}）\n")
@@ -1579,7 +1668,41 @@ def render_markdown(market, deep) -> str:
 
         out.append("---\n" + d["summary"] + "\n\n---\n")
 
+    # ===== Layer 3（自定义筛选 — 仅 screening 非空，从 run_full_brief 触发）=====
+    if screening:
+        out.append(_render_screening(screening))
+
     return "\n".join(out)
+
+
+def _render_screening(screening: dict) -> str:
+    """Layer 3：自定义筛选结果，markdown 表格。"""
+    hits = screening.get("hits") or []
+    n_cand = screening.get("candidates", 0)
+    lines = ["\n## 📊 自定义筛选（4 条件同时满足）\n"]
+    lines.append(
+        "**条件**：① 涨幅 ∈ [3%, 5%] · ② 收盘 > MA5 且 > MA10 · "
+        "③ 量比 > 2（今日/5日均量） · ④ 今日量 > 昨日量"
+    )
+    if screening.get("error"):
+        lines.append(f"\n⚠️ 数据拉取失败：{screening['error']}")
+        return "\n".join(lines)
+    lines.append(f"\n**结果**：涨幅过滤后 {n_cand} 只候选 → 全条件命中 **{len(hits)}** 只\n")
+    if not hits:
+        lines.append("_今日无满足全部 4 条件的股票_\n")
+        return "\n".join(lines)
+    lines.append("| 代码 | 名称 | 涨幅 | 收盘 | MA5 | MA10 | 量比 | 今/昨量(万手) |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    max_show = 50
+    for h in hits[:max_show]:
+        lines.append(
+            f"| {h['code']} | {h['name']} | {h['涨幅%']}% | {h['收盘']} | "
+            f"{h['MA5']} | {h['MA10']} | **{h['量比']}** | "
+            f"{int(h['今日量(万手)'])}/{int(h['昨日量(万手)'])} |"
+        )
+    if len(hits) > max_show:
+        lines.append(f"\n_…还有 {len(hits) - max_show} 只按量比降序未展示_\n")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
