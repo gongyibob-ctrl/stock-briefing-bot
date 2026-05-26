@@ -326,14 +326,14 @@ def _task_stock_analysis(message_id: str, code: str, name: str, user_context: st
         import akshare as ak
         import pandas as pd
         from brief import (
-            YESTERDAY, TODAY, gather_a, llm_summarize, safe,
+            YESTERDAY, TODAY, gather_a, llm_summarize, safe_df,
         )
         # 单股只需要 lookup 用的几张表（不拉板块 + 游资聚合，那是 Layer 1 全市场动作）
         market = {
-            "lhb":         safe("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY), pd.DataFrame()),
-            "dzjy":        safe("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY), pd.DataFrame()),
-            "margin_sse":  safe("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY), pd.DataFrame()),
-            "margin_szse": safe("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY), pd.DataFrame()),
+            "lhb":         safe_df("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY)),
+            "dzjy":        safe_df("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY)),
+            "margin_sse":  safe_df("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY)),
+            "margin_szse": safe_df("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY)),
             "industry_list": pd.DataFrame(),  # 板块同业跳过
         }
         # 盘中场景：腾讯 qt 实时优先，baostock 兜底（baostock 只给日 K 收盘价）

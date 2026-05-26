@@ -38,9 +38,7 @@ load_dotenv(ROOT / ".env")
 litellm.drop_params = True
 
 WATCHLIST = json.loads((ROOT / "watchlist.json").read_text())["watchlist"]
-TODAY = datetime.now().strftime("%Y%m%d")
-YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-LAST_MONTH = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")  # K 线要 30 天才能算 MA20
+# 注意：TODAY / YESTERDAY / LAST_MONTH 定义移到 _bs_login 之后（_last_trading_day_str 依赖 baostock）
 
 
 # ====================================================
@@ -120,6 +118,36 @@ def _bs_logout():
         _BS_LOGGED_IN = False
 
 
+def _last_trading_day_str(before: datetime | None = None) -> str:
+    """返回严格早于 before（默认=now）的最近 A 股交易日，YYYYMMDD 格式。
+    主源 baostock query_trade_dates；失败 fallback 按周末规则倒推（不处理节假日）。
+    周一→上周五，周日→上周五，其他→前 1 天。"""
+    before = before or datetime.now()
+    cutoff = before.strftime("%Y-%m-%d")
+    try:
+        _bs_login()
+        start = (before - timedelta(days=10)).strftime("%Y-%m-%d")
+        rs = bs.query_trade_dates(start_date=start, end_date=cutoff)
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+        past_trading = [r[0] for r in rows if r[1] == "1" and r[0] < cutoff]
+        if past_trading:
+            return past_trading[-1].replace("-", "")
+    except Exception as e:
+        print(f"⚠️  _last_trading_day_str baostock 失败 ({type(e).__name__})，按周末规则 fallback")
+    d = before - timedelta(days=1)
+    while d.weekday() >= 5:  # Sat=5, Sun=6
+        d -= timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
+TODAY = datetime.now().strftime("%Y%m%d")
+# YESTERDAY 语义 = 上一个真实交易日（周一时 = 上周五，不是字面 today-1）
+YESTERDAY = _last_trading_day_str()
+LAST_MONTH = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+
+
 def _bs_code(code: str) -> str:
     return f"sh.{code}" if code.startswith("6") else f"sz.{code}"
 
@@ -148,18 +176,25 @@ def safe(label: str, fn, default=None, retries: int = 3, backoff: float = 2.0):
     return default
 
 
+def safe_df(label: str, fn, retries: int = 3, backoff: float = 2.0) -> pd.DataFrame:
+    """safe() 的 DataFrame 严格版：异常 / None / 非 DF 都兜成空 DF。
+    akshare 某些接口（如 dzjy）非交易日会返回 None 而不抛异常，下游 .columns 直接崩。"""
+    res = safe(label, fn, default=None, retries=retries, backoff=backoff)
+    return res if isinstance(res, pd.DataFrame) else pd.DataFrame()
+
+
 # ====================================================
 # A 股 — Layer 1 全市场预拉
 # ====================================================
 def fetch_market_tables() -> dict:
     print("  · 龙虎榜 / 大宗 / 融资融券 / 北向 / 板块...")
     tables = {
-        "lhb":         safe("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY), pd.DataFrame()),
-        "dzjy":        safe("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY), pd.DataFrame()),
-        "margin_sse":  safe("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY), pd.DataFrame()),
-        "margin_szse": safe("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY), pd.DataFrame()),
+        "lhb":         safe_df("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY)),
+        "dzjy":        safe_df("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY)),
+        "margin_sse":  safe_df("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY)),
+        "margin_szse": safe_df("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY)),
         "hsgt_summary": _hsgt_summary(),
-        "industry_list": safe("行业列表", ak.stock_board_industry_name_em, pd.DataFrame()),
+        "industry_list": safe_df("行业列表", ak.stock_board_industry_name_em),
     }
     # 全市场游资动作聚合（拉 Top 20 上榜股的席位明细）
     tables["hot_money"] = layer1_hot_money_summary(tables["lhb"], YESTERDAY, top_n=20)
@@ -1209,10 +1244,10 @@ def _render_frontmatter(fm: dict) -> str:
 def _fetch_lookup_tables_only() -> dict:
     """轻量版 market 表：只拉 watchlist lookup 需要的（跳过游资聚合 + 板块，省 1-2 分钟）"""
     return {
-        "lhb":           safe("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY), pd.DataFrame()),
-        "dzjy":          safe("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY), pd.DataFrame()),
-        "margin_sse":    safe("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY), pd.DataFrame()),
-        "margin_szse":   safe("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY), pd.DataFrame()),
+        "lhb":           safe_df("龙虎榜", lambda: ak.stock_lhb_detail_daily_sina(date=YESTERDAY)),
+        "dzjy":          safe_df("大宗交易", lambda: ak.stock_dzjy_mrtj(start_date=YESTERDAY, end_date=TODAY)),
+        "margin_sse":    safe_df("融资融券-沪", lambda: ak.stock_margin_detail_sse(date=YESTERDAY)),
+        "margin_szse":   safe_df("融资融券-深", lambda: ak.stock_margin_detail_szse(date=YESTERDAY)),
         "industry_list": pd.DataFrame(),
     }
 
