@@ -641,6 +641,67 @@ def a_kline(code: str, prefer_realtime: bool = False) -> dict:
     return {}
 
 
+def _a_kline_baostock_df(code: str) -> pd.DataFrame:
+    """baostock 拉 ~50 天 K 线，返回原始 DataFrame (日期/收盘/成交量/涨跌幅)。
+    成交量单位 = 手（baostock 标准）"""
+    _bs_login()
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+    rs = bs.query_history_k_data_plus(
+        _bs_code(code),
+        "date,close,volume,pctChg",
+        start_date=start, end_date=end,
+        frequency="d", adjustflag="3",
+    )
+    rows = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["日期", "收盘", "成交量", "涨跌幅"])
+    for col in ("收盘", "成交量", "涨跌幅"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _a_kline_tencent_df(code: str) -> pd.DataFrame:
+    """腾讯 ifzq.gtimg.cn 40 天 K 线 → 原始 DataFrame。成交量单位 = 手"""
+    import requests
+    sym = f"{_tencent_prefix(code)}{code}"
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,40,qfq"
+    r = requests.get(url, timeout=12)
+    data = r.json()
+    if data.get("code") != 0:
+        return pd.DataFrame()
+    kdata = data.get("data", {}).get(sym, {})
+    key = next((k for k in kdata if "day" in k.lower()), None)
+    if not key or not kdata[key]:
+        return pd.DataFrame()
+    df = pd.DataFrame(kdata[key])
+    df = df.iloc[:, :6]
+    df.columns = ["日期", "open", "收盘", "high", "low", "成交量"]
+    for col in ("收盘", "成交量"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["涨跌幅"] = df["收盘"].pct_change() * 100
+    return df[["日期", "收盘", "成交量", "涨跌幅"]]
+
+
+def a_kline_df(code: str) -> pd.DataFrame:
+    """获取 ~40 日 K 线原始 DataFrame，3 源 fallback。
+    返回列：日期/收盘/成交量(单位:手)/涨跌幅(%)
+    给 run_custom_screening 用，需要时间序列；不同于 a_kline() 返回 summary dict。
+    从美西访问中国数据源经常抽风，这里用 baostock 主源（最稳）+ 腾讯兜底。"""
+    sources = [
+        ("baostock", lambda: _a_kline_baostock_df(code), 1, 0.5),
+        ("腾讯",     lambda: _a_kline_tencent_df(code), 2, 1.0),
+    ]
+    for label, fn, retries, backoff in sources:
+        out = safe_df(f"K线df {code}[{label}]", fn, retries=retries, backoff=backoff)
+        if not out.empty and len(out) >= 11:
+            return out
+    return pd.DataFrame()
+
+
 def _enrich_kline(df: pd.DataFrame) -> dict:
     """从 K 线 DF 计算 MA + MACD + 近期统计"""
     close = df["收盘"].astype(float)
@@ -1339,17 +1400,15 @@ def run_custom_screening() -> dict:
         name = str(row["名称"]).strip()
         if i % 50 == 0:
             print(f"    进度 {i}/{n_cand}，已命中 {len(hits)}")
-        kline = safe_df(
-            f"K线 {code}",
-            lambda c=code: ak.stock_zh_a_hist(symbol=c, period="daily", adjust="qfq", end_date=TODAY),
-            retries=1, backoff=0.5,
-        )
+        # 用 a_kline_df：baostock 主源 + 腾讯兜底（不再单走 akshare hist，那个网络挂得最频繁）
+        kline = a_kline_df(code)
         if kline.empty or len(kline) < 11:
             continue
         try:
             recent = kline.tail(11).reset_index(drop=True)
             close_s = recent["收盘"].astype(float)
             today_close = float(close_s.iloc[-1])
+            today_pct = float(recent["涨跌幅"].iloc[-1])  # K 线权威 — 不用 spot 的（spot 可能是盘中实时）
             ma5 = float(close_s.tail(5).mean())
             ma10 = float(close_s.tail(10).mean())
             today_vol = float(recent["成交量"].iloc[-1])
@@ -1357,6 +1416,9 @@ def run_custom_screening() -> dict:
             vol_5_avg = float(recent["成交量"].iloc[-6:-1].mean())  # 不含今日的过去 5 日均量
             liang_bi = today_vol / vol_5_avg if vol_5_avg > 0 else 0.0
         except (KeyError, IndexError, ValueError, TypeError):
+            continue
+        # 用 K 线最新一行的涨幅复核一次 [3%, 5%]，避免 spot 盘中数据和 K 线最近收盘错位
+        if not (3.0 <= today_pct <= 5.0):
             continue
         if (
             today_close > ma5
@@ -1367,13 +1429,14 @@ def run_custom_screening() -> dict:
             hits.append({
                 "code": code,
                 "name": name,
-                "涨幅%": round(float(row["涨跌幅"]), 2),
+                "涨幅%": round(today_pct, 2),
                 "收盘": round(today_close, 2),
                 "MA5": round(ma5, 2),
                 "MA10": round(ma10, 2),
                 "量比": round(liang_bi, 2),
-                "今日量(万手)": round(today_vol / 100, 0),
-                "昨日量(万手)": round(prev_vol / 100, 0),
+                # 成交量单位 = 手（baostock/腾讯标准）；万手 = /10000
+                "今日量(万手)": round(today_vol / 10000, 0),
+                "昨日量(万手)": round(prev_vol / 10000, 0),
             })
     print(f"    ✅ 命中 {len(hits)} 只 / 候选 {n_cand} 只")
     hits.sort(key=lambda x: -x["量比"])  # 量比降序：放量最猛的最前
