@@ -341,12 +341,10 @@ def _task_stock_analysis(message_id: str, code: str, name: str, user_context: st
         summary = llm_summarize(name, code, payload, user_context=user_context)
         # 包装成 markdown
         k = payload.get("K线技术") or {}
-        h = payload.get("北向持股") or {}
         head = [f"### {name}（{code}）\n"]
         if k:
             head.append(f"**今日**：¥{k.get('收盘')} ({k.get('当日涨跌幅%')}%) | 5 日 {k.get('5日累计涨跌幅%')}% | MA: {k.get('均线排列')} | MACD: {k.get('MACD金叉死叉')} (柱 {k.get('MACD柱')})\n")
-        if h:
-            head.append(f"**北向**：占 A 股 {h.get('持股占A股%')}% | 7 日累计 **{h.get('7日累计增持(亿元)')} 亿**\n")
+        # 北向 行已删除（2024-08-19 起停发）
         if user_context:
             head.append(f"**🧑 你的 context**：{user_context}\n")
         body = "\n".join(head) + "\n---\n" + summary
