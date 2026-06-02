@@ -1184,19 +1184,30 @@ def llm_summarize(stock_name: str, code: str, payload: dict, user_context: str =
         )
     parts.append(f"### 数据\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n```")
     user_prompt = "\n".join(parts)
-    resp = completion(
-        model=os.getenv("LLM_MODEL", "deepseek/deepseek-chat"),
-        api_base=os.getenv("LLM_BASE_URL"),
-        api_key=os.getenv("LLM_API_KEY"),
-        messages=[
-            {"role": "system", "content": SYS_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=2000,
-    )
-    content = (resp.choices[0].message.content or "").strip()
-    return content or "（LLM 输出为空）"
+    # deepseek-v4-pro 等推理模型会先生成 reasoning（计入 max_tokens 且耗时长）：
+    # max_tokens 要给推理留足空间，否则正文被截空；timeout 够长 + 重试一次防偶发高延迟。
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = completion(
+                model=os.getenv("LLM_MODEL", "deepseek/deepseek-chat"),
+                api_base=os.getenv("LLM_BASE_URL"),
+                api_key=os.getenv("LLM_API_KEY"),
+                messages=[
+                    {"role": "system", "content": SYS_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=8000,  # 推理 token + 正文(较长的逐股分析)，留足余量防截断
+                timeout=180,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            return content or "（LLM 输出为空）"
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(2)
+    raise last_err
 
 
 # ====================================================

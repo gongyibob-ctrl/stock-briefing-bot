@@ -554,23 +554,31 @@ def llm_pick_top3(sector: dict, candidates: list[dict]) -> str:
         f"候选股池（已按流通市值排序）：\n```json\n"
         f"{json.dumps(slim, ensure_ascii=False, indent=2)}\n```"
     )
-    try:
-        resp = litellm.completion(
-            model=os.getenv("LLM_MODEL", "deepseek/deepseek-chat"),
-            api_base=os.getenv("LLM_BASE_URL"),
-            api_key=os.getenv("LLM_API_KEY"),
-            messages=[
-                {"role": "system", "content": SECTOR_LLM_SYS},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.3,
-            max_tokens=1800,  # 3 个 Top 加 PASS 名单，~600 字中文 ≈ 1500 token，留余量
-            timeout=60,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        return content or "⚠️ LLM 返回空"
-    except Exception as e:
-        return f"⚠️ LLM 失败: {type(e).__name__}: {e}"
+    # deepseek-v4-pro 等推理模型会先生成 reasoning（计入 max_tokens 且耗时长）：
+    # max_tokens 要给推理留足空间（实测复杂 prompt 推理~1-3k token），否则正文被截空；
+    # timeout 要够长，单次失败再重试一次（DeepSeek 偶发高延迟）。
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = litellm.completion(
+                model=os.getenv("LLM_MODEL", "deepseek/deepseek-chat"),
+                api_base=os.getenv("LLM_BASE_URL"),
+                api_key=os.getenv("LLM_API_KEY"),
+                messages=[
+                    {"role": "system", "content": SECTOR_LLM_SYS},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                max_tokens=6000,  # 推理 token + 正文(~1500)，留足余量防截断
+                timeout=180,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            return content or "⚠️ LLM 返回空"
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(2)
+    return f"⚠️ LLM 失败: {type(last_err).__name__}: {last_err}"
 
 
 # ====================================================
@@ -603,14 +611,21 @@ def enrich_sectors_with_quality(
 
     sleep_between 控制对同花顺的请求间隔，避免触发 401。
     """
+    # 阶段 1：抓候选池（顺序 + sleep，避免同花顺 401）
     for i, s in enumerate(sectors):
         if i > 0:
             time.sleep(sleep_between)
         s["candidates"] = top_quality_stocks_in_sector(s, pool_size=pool_size)
-        if call_llm and s["candidates"]:
-            s["llm_pick"] = llm_pick_top3(s, s["candidates"])
-        else:
-            s["llm_pick"] = ""
+        s["llm_pick"] = ""
+    # 阶段 2：LLM 精选（各板块独立 API 调用 → 并发，避免推理模型 5 次串行拖到几分钟）
+    if call_llm:
+        from concurrent.futures import ThreadPoolExecutor
+        targets = [s for s in sectors if s["candidates"]]
+        if targets:
+            with ThreadPoolExecutor(max_workers=min(5, len(targets))) as ex:
+                picks = list(ex.map(lambda s: llm_pick_top3(s, s["candidates"]), targets))
+            for s, pick in zip(targets, picks):
+                s["llm_pick"] = pick
     return sectors
 
 
@@ -696,7 +711,7 @@ if __name__ == "__main__":
     socket.setdefaulttimeout(15)
     from dotenv import load_dotenv
     from pathlib import Path
-    load_dotenv(Path(__file__).parent.parent / ".env")
+    load_dotenv(Path(__file__).parent / ".env")
 
     bs.login()
     try:
