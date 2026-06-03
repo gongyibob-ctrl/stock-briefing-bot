@@ -1374,14 +1374,14 @@ def _process_stocks(market: dict, stocks_filter: list | None = None, dry_run: bo
 
 def run_custom_screening() -> dict:
     """收盘后自定义筛选 — 4 条件同时满足才入选：
-    1. 涨幅 ∈ [3%, 5%]
+    1. 涨幅 > 5%
     2. 收盘 > MA5 且 > MA10
     3. 量比 > 2（今日成交量 / 过去 5 个交易日均量）
     4. 今日成交量 > 前一日
 
     返回 {"hits": [...], "candidates": N}
     """
-    print("  · 自定义筛选（涨幅[3,5]% + 站稳MA5/10 + 量比>2 + 放量）...")
+    print("  · 自定义筛选（涨幅>5% + 站稳MA5/10 + 量比>2 + 放量）...")
     # 主源 EM（快 ~2s）→ 备源 新浪 spot（慢 ~30s 但更稳）
     # 退到美西访问中国财经接口偶发挂，加大 retry：EM 5 次 / Sina 3 次
     spot = safe_df("全市场快照(EM)", lambda: ak.stock_zh_a_spot_em(), retries=5, backoff=5.0)
@@ -1398,9 +1398,9 @@ def run_custom_screening() -> dict:
 
     # Step 1: 涨幅过滤
     spot = spot.dropna(subset=["涨跌幅"]).copy()
-    candidates = spot[(spot["涨跌幅"] >= 3.0) & (spot["涨跌幅"] <= 5.0)].copy()
+    candidates = spot[spot["涨跌幅"] > 5.0].copy()
     n_cand = len(candidates)
-    print(f"    涨幅 [3%, 5%] 候选 {n_cand} 只 → 逐个拉 K 线验证 MA / 量比 / 前日量")
+    print(f"    涨幅 >5% 候选 {n_cand} 只 → 逐个拉 K 线验证 MA / 量比 / 前日量")
     if n_cand == 0:
         return {"hits": [], "candidates": 0}
 
@@ -1428,8 +1428,8 @@ def run_custom_screening() -> dict:
             liang_bi = today_vol / vol_5_avg if vol_5_avg > 0 else 0.0
         except (KeyError, IndexError, ValueError, TypeError):
             continue
-        # 用 K 线最新一行的涨幅复核一次 [3%, 5%]，避免 spot 盘中数据和 K 线最近收盘错位
-        if not (3.0 <= today_pct <= 5.0):
+        # 用 K 线最新一行的涨幅复核一次 >5%，避免 spot 盘中数据和 K 线最近收盘错位
+        if not (today_pct > 5.0):
             continue
         if (
             today_close > ma5
@@ -1734,7 +1734,7 @@ def _render_screening(screening: dict) -> str:
     n_cand = screening.get("candidates", 0)
     lines = ["\n## 📊 自定义筛选（4 条件同时满足）\n"]
     lines.append(
-        "**条件**：① 涨幅 ∈ [3%, 5%] · ② 收盘 > MA5 且 > MA10 · "
+        "**条件**：① 涨幅 > 5% · ② 收盘 > MA5 且 > MA10 · "
         "③ 量比 > 2（今日/5日均量） · ④ 今日量 > 昨日量"
     )
     if screening.get("error"):
