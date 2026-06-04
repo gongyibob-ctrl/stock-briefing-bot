@@ -1007,8 +1007,9 @@ def push_feishu(title: str, content_md: str) -> bool:
 
 def _post_card_via_app(client, chat_id: str, title: str, body_md: str) -> bool:
     """单条飞书 interactive card via 应用机器人 API"""
-    if len(body_md) > 4800:
-        body_md = body_md[:4800] + "\n\n... (内容截断，完整版见本地 reports/)"
+    # 飞书 markdown 元素实际支持 30000+ 字符；这里保守 9500，能装下 50 行筛选表 + 头部
+    if len(body_md) > 9500:
+        body_md = body_md[:9500] + "\n\n... (内容截断，完整版见本地 reports/)"
     card = {
         "config": {"wide_screen_mode": True, "enable_forward": True},
         "header": {
@@ -1052,73 +1053,96 @@ def _is_only_header(s: str) -> bool:
     return True
 
 
-def _split_markdown(md: str, layer1_max: int = 4500) -> list[str]:
-    """切段：
-    - Layer 1 默认 1 段；超过 layer1_max 按 ### 切
-    - 自选股深度里每个 ### 永远 = 1 段
-    - 纯标题段（无具体内容）自动 merge 到下一段，不独立成卡
-    """
+def _split_markdown(md: str, max_chunk: int = 4500) -> list[str]:
+    """切段：先按 ## H2 边界切（Layer 1 全市场态势、Layer 2 自选股深度、
+    Layer 3 自定义筛选 各自独立成段）；H2 内部若仍超 max_chunk 再按 ### H3 切。
+    自选股深度的 ### 永远独立成段。纯标题段（无具体内容）自动 merge 到下一段。"""
     lines = md.split("\n")
-    layer1_lines: list[str] = []
-    layer2_chunks: list[str] = []
-    in_individual = False
-    cur: list[str] = []
 
-    def push_cur():
+    # ---- Step 1: 按 ## H2 边界切大块 ----
+    h2_blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("## "):
+            if current and any(x.strip() for x in current):
+                h2_blocks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current and any(x.strip() for x in current):
+        h2_blocks.append(current)
+
+    # ---- Step 2: 每个 H2 块按需细分；纯 header 块（如 # H1 title）merge 到下一个内容块 ----
+    sections: list[str] = []
+    pending_header = ""  # 累积 H1/H2-only 块，merge 到下一个有内容的 section
+    for block in h2_blocks:
+        header_line = block[0] if block and block[0].startswith("## ") else ""
+        is_watchlist = "自选股深度" in header_line  # Layer 2: 每个 ### 强制独立成段
+        block_md = "\n".join(block).strip()
+        if not block_md:
+            continue
+        if _is_only_header(block_md):
+            pending_header = (pending_header + "\n\n" + block_md).strip() if pending_header else block_md
+            continue
+        # 合并 pending_header 到当前块头部（只合并一次，给第一个内容块）
+        if pending_header:
+            block_md = pending_header + "\n\n" + block_md
+            block = pending_header.split("\n") + [""] + block
+            pending_header = ""
+
+        # 自选股深度（已停用，但保留兼容）：每个 ### 独立
+        if is_watchlist:
+            cur: list[str] = []
+            for l in block:
+                if l.startswith("### ") and cur and any(x.strip() for x in cur):
+                    s = "\n".join(cur).strip()
+                    if s and len(s) > 30 and not _is_only_header(s):
+                        sections.append(s)
+                    cur = []
+                cur.append(l)
+            if cur:
+                s = "\n".join(cur).strip()
+                if s and len(s) > 30 and not _is_only_header(s):
+                    sections.append(s)
+            continue
+
+        # 其他 H2：整块就装下 → 1 段
+        if len(block_md) <= max_chunk:
+            sections.append(block_md)
+            continue
+
+        # H2 块超长：按内部 ### 切，纯标题段 merge 到下一段
+        sub_chunks: list[str] = []
+        cur = []
+        for l in block:
+            if l.startswith("### ") and cur and any(x.strip() for x in cur):
+                s = "\n".join(cur).strip()
+                if s and len(s) > 30:
+                    sub_chunks.append(s)
+                cur = []
+            cur.append(l)
         if cur:
             s = "\n".join(cur).strip()
             if s and len(s) > 30:
-                layer2_chunks.append(s)
-            cur.clear()
+                sub_chunks.append(s)
 
-    for line in lines:
-        if line.startswith("## ") and "自选股深度" in line:
-            in_individual = True
-            continue
-        if not in_individual:
-            layer1_lines.append(line)
-        else:
-            if line.startswith("### "):
-                push_cur()
-            cur.append(line)
-    push_cur()
-
-    # Layer 1 切段
-    layer1_chunks: list[str] = []
-    layer1_md = "\n".join(layer1_lines).strip()
-    if layer1_md:
-        if len(layer1_md) <= layer1_max:
-            layer1_chunks.append(layer1_md)
-        else:
-            sub: list[str] = []
-            for l in layer1_lines:
-                if l.startswith("### ") and sub and any(x.strip() for x in sub):
-                    s = "\n".join(sub).strip()
-                    if s and len(s) > 30:
-                        layer1_chunks.append(s)
-                    sub = []
-                sub.append(l)
-            if sub:
-                s = "\n".join(sub).strip()
-                if s and len(s) > 30:
-                    layer1_chunks.append(s)
-
-    # 关键修复：纯标题段（H1/H2 only）merge 到下一段头部，不独立成卡
-    merged_layer1: list[str] = []
-    pending_header = ""
-    for chunk in layer1_chunks:
-        if _is_only_header(chunk):
-            pending_header = (pending_header + "\n\n" + chunk).strip() if pending_header else chunk
-        else:
-            if pending_header:
-                merged_layer1.append(pending_header + "\n\n" + chunk)
-                pending_header = ""
+        # 纯标题段 merge 到下一段头部，不独立成卡
+        pending_header = ""
+        for chunk in sub_chunks:
+            if _is_only_header(chunk):
+                pending_header = (pending_header + "\n\n" + chunk).strip() if pending_header else chunk
             else:
-                merged_layer1.append(chunk)
-    if pending_header:
-        merged_layer1.append(pending_header)
+                if pending_header:
+                    sections.append(pending_header + "\n\n" + chunk)
+                    pending_header = ""
+                else:
+                    sections.append(chunk)
+        if pending_header:
+            sections.append(pending_header)
 
-    sections = merged_layer1 + layer2_chunks
+    # 文档末尾还有 pending_header（不大可能但保险）
+    if pending_header:
+        sections.append(pending_header)
     return sections
 
 
