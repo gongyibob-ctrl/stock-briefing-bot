@@ -1397,15 +1397,14 @@ def _process_stocks(market: dict, stocks_filter: list | None = None, dry_run: bo
 
 
 def run_custom_screening() -> dict:
-    """收盘后自定义筛选 — 4 条件同时满足才入选：
+    """收盘后自定义筛选 — 3 条件同时满足才入选：
     1. 涨幅 > 5%
     2. 收盘 > MA5 且 > MA10
-    3. 量比 > 2（今日成交量 / 过去 5 个交易日均量）
-    4. 今日成交量 > 前一日
+    3. 量比 > 2（今日成交量 / 昨日成交量）
 
     返回 {"hits": [...], "candidates": N}
     """
-    print("  · 自定义筛选（涨幅>5% + 站稳MA5/10 + 量比>2 + 放量）...")
+    print("  · 自定义筛选（涨幅>5% + 站稳MA5/10 + 量比>2）...")
     # 主源 EM（快 ~2s）→ 备源 新浪 spot（慢 ~30s 但更稳）
     # 退到美西访问中国财经接口偶发挂，加大 retry：EM 5 次 / Sina 3 次
     spot = safe_df("全市场快照(EM)", lambda: ak.stock_zh_a_spot_em(), retries=5, backoff=5.0)
@@ -1424,7 +1423,7 @@ def run_custom_screening() -> dict:
     spot = spot.dropna(subset=["涨跌幅"]).copy()
     candidates = spot[spot["涨跌幅"] > 5.0].copy()
     n_cand = len(candidates)
-    print(f"    涨幅 >5% 候选 {n_cand} 只 → 逐个拉 K 线验证 MA / 量比 / 前日量")
+    print(f"    涨幅 >5% 候选 {n_cand} 只 → 逐个拉 K 线验证 MA / 量比")
     if n_cand == 0:
         return {"hits": [], "candidates": 0}
 
@@ -1448,18 +1447,17 @@ def run_custom_screening() -> dict:
             ma10 = float(close_s.tail(10).mean())
             today_vol = float(recent["成交量"].iloc[-1])
             prev_vol = float(recent["成交量"].iloc[-2])
-            vol_5_avg = float(recent["成交量"].iloc[-6:-1].mean())  # 不含今日的过去 5 日均量
-            liang_bi = today_vol / vol_5_avg if vol_5_avg > 0 else 0.0
+            liang_bi = today_vol / prev_vol if prev_vol > 0 else 0.0
         except (KeyError, IndexError, ValueError, TypeError):
             continue
         # 用 K 线最新一行的涨幅复核一次 >5%，避免 spot 盘中数据和 K 线最近收盘错位
         if not (today_pct > 5.0):
             continue
+        # 条件 ④（今日量 > 昨日量）已被 ③（量比 > 2 = 今日量/昨日量 > 2）数学包含，故移除
         if (
             today_close > ma5
             and today_close > ma10
             and liang_bi > 2.0
-            and today_vol > prev_vol
         ):
             hits.append({
                 "code": code,
@@ -1756,17 +1754,16 @@ def _render_screening(screening: dict) -> str:
     """Layer 3：自定义筛选结果，markdown 表格。"""
     hits = screening.get("hits") or []
     n_cand = screening.get("candidates", 0)
-    lines = ["\n## 📊 自定义筛选（4 条件同时满足）\n"]
+    lines = ["\n## 📊 自定义筛选（3 条件同时满足）\n"]
     lines.append(
-        "**条件**：① 涨幅 > 5% · ② 收盘 > MA5 且 > MA10 · "
-        "③ 量比 > 2 · ④ 今日量 > 昨日量"
+        "**条件**：① 涨幅 > 5% · ② 收盘 > MA5 且 > MA10 · ③ 量比 > 2"
     )
     if screening.get("error"):
         lines.append(f"\n⚠️ 数据拉取失败：{screening['error']}")
         return "\n".join(lines)
     lines.append(f"\n**结果**：涨幅过滤后 {n_cand} 只候选 → 全条件命中 **{len(hits)}** 只\n")
     if not hits:
-        lines.append("_今日无满足全部 4 条件的股票_\n")
+        lines.append("_今日无满足全部 3 条件的股票_\n")
         return "\n".join(lines)
     lines.append("| 代码 | 名称 | 涨幅 | 收盘 | MA5 | MA10 | 量比 | 今/昨量(万手) |")
     lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
