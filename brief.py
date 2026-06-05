@@ -1759,7 +1759,7 @@ def _render_screening(screening: dict) -> str:
     lines = ["\n## 📊 自定义筛选（4 条件同时满足）\n"]
     lines.append(
         "**条件**：① 涨幅 > 5% · ② 收盘 > MA5 且 > MA10 · "
-        "③ 量比 > 2（今日/5日均量） · ④ 今日量 > 昨日量"
+        "③ 量比 > 2 · ④ 今日量 > 昨日量"
     )
     if screening.get("error"):
         lines.append(f"\n⚠️ 数据拉取失败：{screening['error']}")
